@@ -25,8 +25,22 @@ Flags: `--xfrm-only`, `--rxrpc-only`, `--no-cleanup`, `-v`.
 Result: VULNERABLE — kernel mutated probe-file page cache.
 ```
 
-Verdicts: `VULNERABLE` / `NOT_VULNERABLE` / `INCONCLUSIVE`. Exit `1` if
-any vulnerable, else `0`.
+Per-probe verdicts:
+
+| Verdict          | Meaning                                                                    |
+|------------------|----------------------------------------------------------------------------|
+| `VULNERABLE`     | Probe ran end-to-end, kernel mutated the page cache.                       |
+| `NOT_VULNERABLE` | Probe ran end-to-end, page cache unchanged (kernel-side fix).              |
+| `UNREACHABLE`    | Vulnerable primitive surface absent (e.g. `esp4`/`rxrpc` modules blocked). |
+| `INCONCLUSIVE`   | Probe could not be run end-to-end for an unclear reason.                   |
+
+Exit code:
+
+| Exit | Meaning                                                                                |
+|------|----------------------------------------------------------------------------------------|
+| `0`  | `NOT_VULNERABLE` — including hosts where the surface is `UNREACHABLE`.                 |
+| `1`  | `VULNERABLE` — at least one probe observed a mutation.                                 |
+| `2`  | `ERROR` / `INCONCLUSIVE` — at least one probe couldn't run; AppArmor and similar.      |
 
 ## Caveat
 

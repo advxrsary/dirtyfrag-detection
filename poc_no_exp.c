@@ -56,10 +56,13 @@
  *   ./dirtyfrag_probe -v           # verbose
  *
  * Exit codes:
- *   0   no probe observed a page-cache mutation (kernel appears patched
- *       OR all probes were inconclusive — see stdout for the breakdown)
- *   1   at least one probe observed a page-cache mutation (vulnerable)
- *   2   usage / fatal setup error
+ *   0   NOT_VULNERABLE — every probe either ran end-to-end without
+ *       mutating the page cache, OR found the vulnerable primitive
+ *       surface unreachable (module blocked / feature absent)
+ *   1   VULNERABLE — at least one probe observed a page-cache mutation
+ *   2   ERROR / INCONCLUSIVE — usage error, fatal setup failure, or at
+ *       least one selected probe could not be run end-to-end for an
+ *       unclear reason (e.g. AppArmor blocked uid_map)
  */
 
 #define _GNU_SOURCE
@@ -156,21 +159,31 @@ static int  g_no_cleanup = 0;
 #define LOG(fmt, ...)  do { if (g_verbose) fprintf(stderr, "[+] " fmt "\n", ##__VA_ARGS__); } while (0)
 #define WARN(fmt, ...) do { if (g_verbose) fprintf(stderr, "[!] " fmt "\n", ##__VA_ARGS__); } while (0)
 
-/* Per-probe verdict.  INCONCLUSIVE means the probe could not run far
- * enough to draw a conclusion (missing kernel feature, permission
- * error, etc.) — distinct from NOT_VULNERABLE which means the probe ran
- * end-to-end and the page cache was unchanged. */
+/* Per-probe verdict.
+ *   VULNERABLE     — probe ran end-to-end, page cache mutated.
+ *   NOT_VULNERABLE — probe ran end-to-end, page cache unchanged
+ *                    (kernel-side fix in place).
+ *   UNREACHABLE    — the kernel feature or module needed by the probe
+ *                    is absent (e.g. modprobe install /bin/false on
+ *                    esp4/rxrpc, or kernel built without CONFIG_XFRM /
+ *                    CONFIG_RXRPC).  Host cannot be exploited via this
+ *                    primitive in its current state.
+ *   INCONCLUSIVE   — probe could not be run end-to-end for an unclear
+ *                    reason (AppArmor blocked uid_map, handshake
+ *                    timeout, transient setup failure, etc.). */
 typedef enum {
-	V_INCONCLUSIVE = 0,
+	V_INCONCLUSIVE   = 0,
 	V_NOT_VULNERABLE = 1,
-	V_VULNERABLE = 2,
+	V_VULNERABLE     = 2,
+	V_UNREACHABLE    = 3,
 } verdict_t;
 
 static const char *verdict_str(verdict_t v) {
 	switch (v) {
-	case V_VULNERABLE:    return "VULNERABLE";
-	case V_NOT_VULNERABLE:return "NOT_VULNERABLE";
-	default:              return "INCONCLUSIVE";
+	case V_VULNERABLE:     return "VULNERABLE";
+	case V_NOT_VULNERABLE: return "NOT_VULNERABLE";
+	case V_UNREACHABLE:    return "UNREACHABLE";
+	default:               return "INCONCLUSIVE";
 	}
 }
 
@@ -292,10 +305,19 @@ static void put_attr(struct nlmsghdr *nlh, int type, const void *data, size_t le
 /* Install one ESN XFRM SA whose seq_hi field carries XFRM_MARKER.  If
  * the kernel is vulnerable, this seq_hi byte-pattern is what gets
  * written into the spliced page. */
+/* Returns 0 on success, -1 on transient/unclear failure (=> INCONCLUSIVE),
+ * -2 if the kernel reported the SA could not be constructed at all
+ * (=> UNREACHABLE: esp4 module blocked, CONFIG_XFRM=n, or similar). */
 static int install_xfrm_sa(uint32_t spi, uint32_t seqhi)
 {
 	int sk = socket(AF_NETLINK, SOCK_RAW, NETLINK_XFRM);
-	if (sk < 0) { WARN("socket(NETLINK_XFRM): %s", strerror(errno)); return -1; }
+	if (sk < 0) {
+		WARN("socket(NETLINK_XFRM): %s", strerror(errno));
+		/* netlink-XFRM itself missing => primitive surface unreachable */
+		if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT)
+			return -2;
+		return -1;
+	}
 	struct sockaddr_nl nl = { .nl_family = AF_NETLINK };
 	if (bind(sk, (struct sockaddr*)&nl, sizeof(nl)) < 0) { close(sk); return -1; }
 
@@ -381,8 +403,15 @@ static int install_xfrm_sa(uint32_t spi, uint32_t seqhi)
 	if (rh->nlmsg_type == NLMSG_ERROR) {
 		struct nlmsgerr *e = NLMSG_DATA(rh);
 		if (e->error) {
-			WARN("XFRM NEWSA error: %s", strerror(-e->error));
-			errno = -e->error;
+			int eno = -e->error;
+			WARN("XFRM NEWSA error: %s", strerror(eno));
+			errno = eno;
+			/* These errnos mean the kernel cannot construct an ESP SA
+			 * at all in its current state (esp4/esp6 modules blocked,
+			 * proto handler unavailable) — surface unreachable. */
+			if (eno == EPROTONOSUPPORT || eno == EAFNOSUPPORT ||
+				eno == EOPNOTSUPP     || eno == ENOPROTOOPT)
+				return -2;
 			return -1;
 		}
 	}
@@ -450,9 +479,14 @@ static verdict_t probe_xfrm(const char *path)
 {
 	const off_t splice_off = 0;
 
-	if (install_xfrm_sa(XFRM_MARKER_SPI, XFRM_MARKER) < 0) {
-		LOG("XFRM: SA install failed (CONFIG_XFRM=n / no NETLINK_XFRM / "
-				"ESN unsupported) — inconclusive");
+	int sa_rc = install_xfrm_sa(XFRM_MARKER_SPI, XFRM_MARKER);
+	if (sa_rc == -2) {
+		LOG("XFRM: kernel cannot construct ESP SA — surface unreachable "
+				"(esp4 blocked, CONFIG_XFRM=n, or similar)");
+		return V_UNREACHABLE;
+	}
+	if (sa_rc < 0) {
+		LOG("XFRM: SA install failed for an unclear reason — inconclusive");
 		return V_INCONCLUSIVE;
 	}
 	LOG("XFRM: ESN SA installed (spi=0x%08x seqhi=0x%08x)",
@@ -851,10 +885,25 @@ fail:
 
 static verdict_t probe_rxrpc(const char *path)
 {
+	/* Quick reachability probe: does the kernel know AF_RXRPC?  If not,
+	 * the rxrpc primitive is unreachable (module blocked / not built). */
+	int test_rxsk = socket(AF_RXRPC, SOCK_DGRAM, PF_INET);
+	if (test_rxsk < 0) {
+		if (errno == EAFNOSUPPORT || errno == EPROTONOSUPPORT) {
+			LOG("rxrpc: AF_RXRPC unavailable (%s) — surface unreachable",
+					strerror(errno));
+			return V_UNREACHABLE;
+		}
+		LOG("rxrpc: AF_RXRPC socket failed (%s) — inconclusive",
+				strerror(errno));
+		return V_INCONCLUSIVE;
+	}
+	close(test_rxsk);
+
 	int test_alg = alg_open_pcbc_fcrypt(RXKAD_SESSION_KEY);
 	if (test_alg < 0) {
-		LOG("rxrpc: pcbc(fcrypt) AF_ALG unavailable — inconclusive");
-		return V_INCONCLUSIVE;
+		LOG("rxrpc: pcbc(fcrypt) AF_ALG unavailable — surface unreachable");
+		return V_UNREACHABLE;
 	}
 	close(test_alg);
 
@@ -951,7 +1000,10 @@ static void usage(const char *argv0)
 		"  --rxrpc-only     run only the rxrpc/rxkad probe\n"
 		"  --no-cleanup     leave the tempfile in place after running\n"
 		"\n"
-		"  Exit 0 = no mutation observed; 1 = vulnerable; 2 = setup error.\n",
+		"  Exit codes:\n"
+		"    0   NOT_VULNERABLE\n"
+		"    1   VULNERABLE\n"
+		"    2   ERROR / INCONCLUSIVE\n",
 		argv0);
 }
 
@@ -995,16 +1047,27 @@ int main(int argc, char **argv)
 	bool any_vuln =
 		(g_run_xfrm  && r.xfrm  == V_VULNERABLE) ||
 		(g_run_rxrpc && r.rxrpc == V_VULNERABLE);
-	bool all_inc =
-		(!g_run_xfrm  || r.xfrm  == V_INCONCLUSIVE) &&
-		(!g_run_rxrpc || r.rxrpc == V_INCONCLUSIVE);
+	bool any_inc =
+		(g_run_xfrm  && r.xfrm  == V_INCONCLUSIVE) ||
+		(g_run_rxrpc && r.rxrpc == V_INCONCLUSIVE);
+	bool any_reachable =
+		(g_run_xfrm  && (r.xfrm  == V_NOT_VULNERABLE || r.xfrm  == V_VULNERABLE)) ||
+		(g_run_rxrpc && (r.rxrpc == V_NOT_VULNERABLE || r.rxrpc == V_VULNERABLE));
 
-	if (any_vuln)
+	if (any_vuln) {
 		printf("Result: VULNERABLE — kernel mutated probe-file page cache.\n");
-	else if (all_inc)
-		printf("Result: INCONCLUSIVE — no probe ran end-to-end (re-run with -v).\n");
-	else
-		printf("Result: NOT_VULNERABLE (within tested primitives).\n");
-
-	return any_vuln ? 1 : 0;
+		return 1;
+	}
+	if (any_inc) {
+		printf("Result: INCONCLUSIVE — at least one probe could not run end-to-end "
+				"(re-run with -v).\n");
+		return 2;
+	}
+	if (!any_reachable) {
+		printf("Result: NOT_VULNERABLE — vulnerable primitive surface is not "
+				"reachable on this host (modules blocked / feature absent).\n");
+		return 0;
+	}
+	printf("Result: NOT_VULNERABLE — kernel did not mutate probe-file page cache.\n");
+	return 0;
 }
